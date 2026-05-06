@@ -11,7 +11,7 @@ source /opt/ros/humble/setup.bash
 export ROS_LOCALHOST_ONLY=1
 export ROS_DOMAIN_ID=0
 export TURTLEBOT3_MODEL=waffle_pi
-export LIBGL_ALWAYS_SOFTWARE=1
+# export LIBGL_ALWAYS_SOFTWARE=1  # Uncomment if GPU issues
 # Our models + turtlebot3 models
 export GAZEBO_MODEL_PATH=/app/models:/opt/ros/humble/share/turtlebot3_gazebo/models:$GAZEBO_MODEL_PATH
 

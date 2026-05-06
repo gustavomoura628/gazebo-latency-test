@@ -39,7 +39,18 @@ RUN chmod +x run.sh docker-entrypoint.sh
 ENV TURTLEBOT3_MODEL=waffle_pi
 ENV ROS_LOCALHOST_ONLY=1
 ENV ROS_DOMAIN_ID=0
-ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV GAZEBO_MODEL_PATH=/app/models:/opt/ros/humble/share/turtlebot3_gazebo/models:/usr/share/gazebo-11/models
+
+# Pre-warm Gazebo: run once during build to compile shaders and cache models
+# This makes runtime startup MUCH faster
+RUN echo "Pre-warming Gazebo (compiling shaders, caching models)..." && \
+    . /opt/ros/humble/setup.sh && \
+    export LIBGL_ALWAYS_SOFTWARE=1 && \
+    Xvfb :99 -screen 0 1024x768x24 & \
+    export DISPLAY=:99 && \
+    sleep 2 && \
+    timeout 60 gzserver /app/worlds/turtlebot3_world.world --verbose 2>&1 | head -50 || true && \
+    echo "Pre-warm complete!"
 
 # Expose video server port
 EXPOSE 8888
