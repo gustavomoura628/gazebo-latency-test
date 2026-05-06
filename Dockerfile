@@ -6,8 +6,10 @@ FROM osrf/ros:humble-desktop-full
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Refresh ROS GPG key (may be expired in base image)
-RUN apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys F42ED6FBAB17C654
+# Re-setup ROS repository with fresh key (base image key may be expired)
+RUN rm -f /etc/apt/sources.list.d/ros2*.list && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" > /etc/apt/sources.list.d/ros2.list
 
 # Install TurtleBot3 packages, GUI dependencies, and Python tools
 RUN apt-get update && apt-get install -y \
