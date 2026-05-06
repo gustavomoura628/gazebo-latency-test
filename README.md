@@ -9,18 +9,22 @@ Teleoperate a simulated robot with adjustable artificial latency to demonstrate 
 - Video stream viewable in any browser (including VR headsets)
 - Adjustable artificial latency: 0ms to 10s
 
-## Quick Start (Docker)
+## Quick Start
 
 ```bash
-docker-compose up
+./run.sh
 ```
 
 Then:
-1. Open http://localhost:8888 in browser (or VR headset browser)
+1. Open http://<YOUR_IP>:8888 in browser (or Quest 3 browser)
 2. Click on the pygame window to control robot with WASD
 3. Adjust latency with slider or buttons
 
-## Manual Setup (Ubuntu 22.04 + ROS 2 Humble)
+## Requirements
+
+- Ubuntu 22.04
+- ROS 2 Humble
+- tmux
 
 ### Install dependencies
 
@@ -58,10 +62,9 @@ Open http://<YOUR_IP>:8888 in browser.
 
 ## Files
 
+- `run.sh` - One-command launcher (starts Gazebo, teleop, video server)
 - `game_teleop.py` - Pygame WASD controller
 - `video_server.py` - MJPEG video server with latency injection
-- `docker-compose.yml` - One-command setup
-- `Dockerfile` - Container build
 
 ## Latency API
 
