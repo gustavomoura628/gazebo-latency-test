@@ -4,6 +4,14 @@
 
 set -e
 
+# Cleanup any existing processes
+echo "Cleaning up previous instances..."
+tmux kill-session -t gazebo 2>/dev/null || true
+pkill -f video_server 2>/dev/null || true
+pkill -f game_teleop 2>/dev/null || true
+fuser -k 8888/tcp 2>/dev/null || true
+sleep 1
+
 # ROS environment - CRITICAL: these fix discovery issues
 source /opt/ros/humble/setup.bash
 unset ROS_DISCOVERY_SERVER
