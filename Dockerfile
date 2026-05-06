@@ -6,6 +6,9 @@ FROM osrf/ros:humble-desktop-full
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Refresh ROS GPG key (may be expired in base image)
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
+
 # Install TurtleBot3 packages, GUI dependencies, and Python tools
 RUN apt-get update && apt-get install -y \
     ros-humble-turtlebot3-gazebo \
