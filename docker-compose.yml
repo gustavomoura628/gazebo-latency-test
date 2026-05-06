@@ -3,14 +3,12 @@ services:
     build: .
     container_name: gazebo-latency-test
 
-    # X11 forwarding for Gazebo and pygame windows
+    # Only X11-specific vars (passed from host)
+    # App config (TURTLEBOT3_MODEL, ROS_*, GAZEBO_MODEL_PATH) is in Dockerfile
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - XAUTHORITY=/tmp/.Xauthority
-      - TURTLEBOT3_MODEL=waffle_pi
-      - ROS_LOCALHOST_ONLY=1
-      - ROS_DOMAIN_ID=0
 
     volumes:
       # X11 socket for GUI

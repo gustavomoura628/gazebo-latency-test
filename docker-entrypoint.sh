@@ -1,21 +1,16 @@
 #!/bin/bash
 # Docker entrypoint - loads robot from world file (avoids spawn service issues)
+# App config (TURTLEBOT3_MODEL, ROS_*, GAZEBO_MODEL_PATH) is set in Dockerfile
 
 set -e
 
 echo "=== Gazebo Latency Test (Docker) ==="
 echo ""
 
-# Setup ROS environment
+# Setup ROS environment (adds ROS commands to PATH)
 source /opt/ros/humble/setup.bash
-export ROS_LOCALHOST_ONLY=1
-export ROS_DOMAIN_ID=0
-export TURTLEBOT3_MODEL=waffle_pi
-# export LIBGL_ALWAYS_SOFTWARE=1  # Uncomment if GPU issues
-# Our models + turtlebot3 models
-export GAZEBO_MODEL_PATH=/app/models:/opt/ros/humble/share/turtlebot3_gazebo/models:$GAZEBO_MODEL_PATH
 
-# Check display
+# Xvfb fallback if no display
 if [ -z "$DISPLAY" ]; then
     echo "No DISPLAY set - starting Xvfb..."
     Xvfb :99 -screen 0 1024x768x24 &
