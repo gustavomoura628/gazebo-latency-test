@@ -8,7 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Re-setup ROS repository with fresh key (base image key may be expired)
 # See: https://discourse.openrobotics.org/t/ros-gpg-key-expiration-incident/20669
-RUN rm -f /etc/apt/sources.list.d/ros2*.list && \
+RUN rm -f /etc/apt/sources.list.d/ros*.list /etc/apt/sources.list.d/ros*.sources && \
+    sed -i '/packages\.ros\.org/d' /etc/apt/sources.list && \
     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" > /etc/apt/sources.list.d/ros2.list
 

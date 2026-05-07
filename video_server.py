@@ -248,10 +248,8 @@ def main():
     server_thread = Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    import socket
-    ip = socket.gethostbyname(socket.gethostname())
     print(f'\n=== Video Server Started ===')
-    print(f'View at: http://{ip}:{args.port}/')
+    print(f'View at: http://127.0.0.1:{args.port}/')
     print(f'Initial latency: {args.latency}ms')
     print(f'Adjust via slider or /latency/<ms> endpoint')
     print('============================\n')
