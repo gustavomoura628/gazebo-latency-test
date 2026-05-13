@@ -27,6 +27,7 @@ class VideoBuffer:
         self.frame_queue = deque()  # (timestamp, frame) pairs
         self.latency_ms = ARTIFICIAL_LATENCY_MS
         self.predict_enabled = False
+        self.hfov_rad = 1.085  # ~62 deg, typical TurtleBot3 Gazebo camera
 
     def set_latency(self, ms):
         with self.lock:
@@ -37,6 +38,11 @@ class VideoBuffer:
         with self.lock:
             self.predict_enabled = bool(enabled)
             print(f"Prediction {'ON' if self.predict_enabled else 'OFF'}")
+
+    def set_hfov_deg(self, deg):
+        with self.lock:
+            self.hfov_rad = float(deg) * np.pi / 180.0
+            print(f"HFOV set to {deg} deg ({self.hfov_rad:.3f} rad)")
 
     def add_frame(self, frame):
         with self.lock:
@@ -199,7 +205,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         if video_buffer.predict_enabled and frame_ts is not None and frame_age_ms > 0:
                             _, _, dyaw = twist_buffer.integrate(frame_ts, time.time())
                             pred_yaw_deg = np.rad2deg(dyaw)
-                            display = predict_view_yaw(display, dyaw)
+                            display = predict_view_yaw(display, dyaw, video_buffer.hfov_rad)
                         # Overlay debug info on frame
                         text = f"Latency: {video_buffer.latency_ms}ms | Frame age: {frame_age_ms:.0f}ms"
                         if video_buffer.predict_enabled:
@@ -240,10 +246,29 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
 
+        elif self.path.startswith('/hfov/'):
+            # Set camera horizontal FOV in degrees: /hfov/62
+            try:
+                deg = float(self.path.split('/')[-1])
+                if deg <= 0 or deg >= 180:
+                    raise ValueError('HFOV must be in (0, 180) degrees')
+                video_buffer.set_hfov_deg(deg)
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(f'HFOV set to {deg} deg\n'.encode())
+            except:
+                self.send_response(400)
+                self.end_headers()
+
         elif self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
+            # Snapshot current server state so the UI reflects reality on reload
+            cur_latency = video_buffer.latency_ms
+            cur_hfov_deg = video_buffer.hfov_rad * 180.0 / np.pi
+            predict_checked = 'checked' if video_buffer.predict_enabled else ''
             html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -260,8 +285,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 <body>
     <img src="/video" alt="Robot Camera">
     <div class="controls">
-        <p>Artificial Latency: <span id="val">{ARTIFICIAL_LATENCY_MS}</span>ms</p>
-        <input type="range" id="latency" min="0" max="10000" step="100" value="{ARTIFICIAL_LATENCY_MS}">
+        <p>Artificial Latency: <span id="val">{cur_latency}</span>ms</p>
+        <input type="range" id="latency" min="0" max="10000" step="100" value="{cur_latency}">
         <br>
         <button onclick="setLatency(0)">0ms</button>
         <button onclick="setLatency(100)">100ms</button>
@@ -275,13 +300,22 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <button onclick="setLatency(10000)">10s</button>
         <p style="margin-top: 20px;">Predictive Display (yaw-only):
             <label style="margin-left: 10px;">
-                <input type="checkbox" id="predict" onchange="setPredict(this.checked)"> Enabled
+                <input type="checkbox" id="predict" {predict_checked} onchange="setPredict(this.checked)"> Enabled
             </label>
+        </p>
+        <p>Camera HFOV:
+            <input type="number" id="hfov" min="10" max="170" step="1" value="{cur_hfov_deg:.1f}" style="width: 80px;" onchange="setHfov(this.value)">
+            <span style="margin-left: 5px;">degrees</span>
+            <button onclick="setHfov(60)" style="padding: 4px 10px; font-size: 13px;">60</button>
+            <button onclick="setHfov(62)" style="padding: 4px 10px; font-size: 13px;">62 (TB3)</button>
+            <button onclick="setHfov(80)" style="padding: 4px 10px; font-size: 13px;">80</button>
+            <button onclick="setHfov(90)" style="padding: 4px 10px; font-size: 13px;">90</button>
         </p>
     </div>
     <script>
         const slider = document.getElementById('latency');
         const val = document.getElementById('val');
+        const hfovInput = document.getElementById('hfov');
         slider.oninput = () => {{ val.textContent = slider.value; }};
         slider.onchange = () => {{ setLatency(slider.value); }};
         function setLatency(ms) {{
@@ -291,6 +325,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         }}
         function setPredict(enabled) {{
             fetch('/predict/' + (enabled ? 1 : 0));
+        }}
+        function setHfov(deg) {{
+            fetch('/hfov/' + deg);
+            hfovInput.value = deg;
         }}
     </script>
 </body>
@@ -339,10 +377,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--latency', type=int, default=0, help='Initial artificial latency in ms')
     parser.add_argument('--port', type=int, default=8080, help='HTTP server port')
+    parser.add_argument('--hfov-deg', type=float, default=62.2,
+                        help='Camera horizontal FOV in degrees (default 62.2, TurtleBot3 Gazebo)')
+    parser.add_argument('--predict', action='store_true', help='Enable yaw-only predictive display at startup')
     args = parser.parse_args()
 
     ARTIFICIAL_LATENCY_MS = args.latency
     video_buffer.set_latency(args.latency)
+    video_buffer.set_hfov_deg(args.hfov_deg)
+    if args.predict:
+        video_buffer.set_predict(True)
 
     rclpy.init()
     node = CameraSubscriber()
@@ -356,8 +400,8 @@ def main():
 
     print(f'\n=== Video Server Started ===')
     print(f'View at: http://127.0.0.1:{args.port}/')
-    print(f'Initial latency: {args.latency}ms')
-    print(f'Endpoints: /latency/<ms>  /predict/<0|1>')
+    print(f'Initial latency: {args.latency}ms  HFOV: {args.hfov_deg} deg  Predict: {"ON" if args.predict else "OFF"}')
+    print(f'Endpoints: /latency/<ms>  /predict/<0|1>  /hfov/<deg>')
     print('============================\n')
 
     try:
