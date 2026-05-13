@@ -28,6 +28,7 @@ class VideoBuffer:
         self.latency_ms = ARTIFICIAL_LATENCY_MS
         self.predict_enabled = False
         self.hfov_rad = 1.085  # ~62 deg, typical TurtleBot3 Gazebo camera
+        self.scene_depth_m = 2.0  # assumed flat-plane scene distance (m)
 
     def set_latency(self, ms):
         with self.lock:
@@ -43,6 +44,11 @@ class VideoBuffer:
         with self.lock:
             self.hfov_rad = float(deg) * np.pi / 180.0
             print(f"HFOV set to {deg} deg ({self.hfov_rad:.3f} rad)")
+
+    def set_scene_depth_m(self, m):
+        with self.lock:
+            self.scene_depth_m = max(0.1, float(m))  # clip to >0 to avoid singular H
+            print(f"Scene depth set to {self.scene_depth_m:.2f} m")
 
     def add_frame(self, frame):
         with self.lock:
@@ -165,21 +171,56 @@ class TwistBuffer:
         return dx, dy, dyaw
 
 
-def predict_view_yaw(frame, yaw_rad, hfov_rad=1.085):
-    """Warp a (delayed) frame by a predicted yaw delta. Voids appear black.
-    yaw_rad > 0 = robot turned CCW from above (left) -> void on left of new frame.
-    hfov_rad default 1.085 rad ~ 62 deg matches typical TurtleBot3 Gazebo camera."""
-    if abs(yaw_rad) < 1e-6:
+def predict_view(frame, dx_robot, dy_robot, dyaw_rad,
+                 hfov_rad=1.085, scene_depth_m=2.0):
+    """Warp a delayed frame by a predicted robot motion. Voids appear black.
+
+    Inputs are in the robot's body frame at frame-capture time (REP-103):
+      dx_robot:  forward displacement, m (+ = forward)
+      dy_robot:  lateral displacement, m (+ = left)
+      dyaw_rad:  yaw rotation,        rad (+ = CCW from above / left turn)
+
+    Uses a plane-induced homography H = K (R - t n^T / d) K^-1 under the flat-
+    plane proxy: the whole scene is assumed to sit at scene_depth_m. Yaw is
+    depth-independent (any plane works); forward motion produces an expansion
+    about the principal point; lateral motion produces a horizontal shift.
+    True parallax (objects at different depths moving by different amounts)
+    requires per-pixel depth -- that is Phase 2b.
+
+    hfov_rad: camera horizontal FOV (default 1.085 ~ 62 deg, TurtleBot3 Gazebo).
+    scene_depth_m: assumed scene distance for the flat-plane proxy.
+    """
+    if abs(dx_robot) < 1e-3 and abs(dy_robot) < 1e-3 and abs(dyaw_rad) < 1e-6:
         return frame
+
+    # Clip forward motion to keep H non-singular when approaching the plane
+    d = max(scene_depth_m, 0.1)
+    dx_robot = float(np.clip(dx_robot, -10.0 * d, 0.8 * d))
+
     h, w = frame.shape[:2]
     fx = (w / 2.0) / np.tan(hfov_rad / 2.0)
     K = np.array([[fx, 0.0, w / 2.0],
                   [0.0, fx, h / 2.0],
                   [0.0, 0.0, 1.0]], dtype=np.float64)
-    R = np.array([[np.cos(yaw_rad), 0.0, np.sin(yaw_rad)],
-                  [0.0,             1.0, 0.0],
-                  [-np.sin(yaw_rad), 0.0, np.cos(yaw_rad)]], dtype=np.float64)
-    H = K @ R @ np.linalg.inv(K)
+    K_inv = np.linalg.inv(K)
+
+    # Robot body -> camera frame (OpenCV camera: +X right, +Y down, +Z forward):
+    #   +x_body (forward) -> +z_cam
+    #   +y_body (left)    -> -x_cam
+    t = np.array([-dy_robot, 0.0, dx_robot], dtype=np.float64)
+
+    # Yaw: robot CCW around body +z is camera around its up axis (-Y_cam).
+    # The R that maps points old_cam -> new_cam under this rotation is R_y(+dyaw)
+    # (verified empirically in Phase 1).
+    R = np.array([[np.cos(dyaw_rad), 0.0, np.sin(dyaw_rad)],
+                  [0.0,              1.0, 0.0],
+                  [-np.sin(dyaw_rad), 0.0, np.cos(dyaw_rad)]], dtype=np.float64)
+
+    # Plane normal in old-camera frame: the assumed flat scene is at +Z = d
+    n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    H_3d = R - np.outer(t, n) / d
+    H = K @ H_3d @ K_inv
     return cv2.warpPerspective(frame, H, (w, h))
 
 
@@ -202,14 +243,19 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     if frame is not None:
                         display = frame.copy()
                         pred_yaw_deg = 0.0
+                        pred_dx = pred_dy = pred_yaw_deg = 0.0
                         if video_buffer.predict_enabled and frame_ts is not None and frame_age_ms > 0:
-                            _, _, dyaw = twist_buffer.integrate(frame_ts, time.time())
+                            pred_dx, pred_dy, dyaw = twist_buffer.integrate(frame_ts, time.time())
                             pred_yaw_deg = np.rad2deg(dyaw)
-                            display = predict_view_yaw(display, dyaw, video_buffer.hfov_rad)
+                            display = predict_view(display, pred_dx, pred_dy, dyaw,
+                                                   video_buffer.hfov_rad,
+                                                   video_buffer.scene_depth_m)
                         # Overlay debug info on frame
                         text = f"Latency: {video_buffer.latency_ms}ms | Frame age: {frame_age_ms:.0f}ms"
                         if video_buffer.predict_enabled:
-                            text += f" | Pred yaw: {pred_yaw_deg:+.1f}deg"
+                            text += (f" | Pred: yaw {pred_yaw_deg:+.1f}deg,"
+                                     f" fwd {pred_dx:+.2f}m, lat {pred_dy:+.2f}m"
+                                     f" @ d={video_buffer.scene_depth_m:.1f}m")
                         cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 80])
                         self.wfile.write(b'--frame\r\n')
@@ -261,6 +307,21 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
 
+        elif self.path.startswith('/scene_depth/'):
+            # Set assumed scene depth in meters: /scene_depth/2.5
+            try:
+                m = float(self.path.split('/')[-1])
+                if m <= 0:
+                    raise ValueError('Scene depth must be > 0 m')
+                video_buffer.set_scene_depth_m(m)
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(f'Scene depth set to {m} m\n'.encode())
+            except:
+                self.send_response(400)
+                self.end_headers()
+
         elif self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -268,6 +329,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             # Snapshot current server state so the UI reflects reality on reload
             cur_latency = video_buffer.latency_ms
             cur_hfov_deg = video_buffer.hfov_rad * 180.0 / np.pi
+            cur_scene_depth = video_buffer.scene_depth_m
             predict_checked = 'checked' if video_buffer.predict_enabled else ''
             html = f'''<!DOCTYPE html>
 <html>
@@ -298,7 +360,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <button onclick="setLatency(3000)">3s</button>
         <button onclick="setLatency(5000)">5s</button>
         <button onclick="setLatency(10000)">10s</button>
-        <p style="margin-top: 20px;">Predictive Display (yaw-only):
+        <p style="margin-top: 20px;">Predictive Display (yaw + forward/lateral, flat-plane):
             <label style="margin-left: 10px;">
                 <input type="checkbox" id="predict" {predict_checked} onchange="setPredict(this.checked)"> Enabled
             </label>
@@ -311,11 +373,20 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             <button onclick="setHfov(80)" style="padding: 4px 10px; font-size: 13px;">80</button>
             <button onclick="setHfov(90)" style="padding: 4px 10px; font-size: 13px;">90</button>
         </p>
+        <p>Scene depth (flat-plane proxy):
+            <input type="number" id="depth" min="0.2" max="50" step="0.1" value="{cur_scene_depth:.1f}" style="width: 80px;" onchange="setDepth(this.value)">
+            <span style="margin-left: 5px;">meters</span>
+            <button onclick="setDepth(1)" style="padding: 4px 10px; font-size: 13px;">1m</button>
+            <button onclick="setDepth(2)" style="padding: 4px 10px; font-size: 13px;">2m</button>
+            <button onclick="setDepth(5)" style="padding: 4px 10px; font-size: 13px;">5m</button>
+            <button onclick="setDepth(10)" style="padding: 4px 10px; font-size: 13px;">10m</button>
+        </p>
     </div>
     <script>
         const slider = document.getElementById('latency');
         const val = document.getElementById('val');
         const hfovInput = document.getElementById('hfov');
+        const depthInput = document.getElementById('depth');
         slider.oninput = () => {{ val.textContent = slider.value; }};
         slider.onchange = () => {{ setLatency(slider.value); }};
         function setLatency(ms) {{
@@ -329,6 +400,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         function setHfov(deg) {{
             fetch('/hfov/' + deg);
             hfovInput.value = deg;
+        }}
+        function setDepth(m) {{
+            fetch('/scene_depth/' + m);
+            depthInput.value = m;
         }}
     </script>
 </body>
@@ -379,12 +454,15 @@ def main():
     parser.add_argument('--port', type=int, default=8080, help='HTTP server port')
     parser.add_argument('--hfov-deg', type=float, default=62.2,
                         help='Camera horizontal FOV in degrees (default 62.2, TurtleBot3 Gazebo)')
-    parser.add_argument('--predict', action='store_true', help='Enable yaw-only predictive display at startup')
+    parser.add_argument('--scene-depth', type=float, default=2.0,
+                        help='Assumed flat-plane scene depth in meters (default 2.0)')
+    parser.add_argument('--predict', action='store_true', help='Enable predictive display at startup')
     args = parser.parse_args()
 
     ARTIFICIAL_LATENCY_MS = args.latency
     video_buffer.set_latency(args.latency)
     video_buffer.set_hfov_deg(args.hfov_deg)
+    video_buffer.set_scene_depth_m(args.scene_depth)
     if args.predict:
         video_buffer.set_predict(True)
 
@@ -400,8 +478,9 @@ def main():
 
     print(f'\n=== Video Server Started ===')
     print(f'View at: http://127.0.0.1:{args.port}/')
-    print(f'Initial latency: {args.latency}ms  HFOV: {args.hfov_deg} deg  Predict: {"ON" if args.predict else "OFF"}')
-    print(f'Endpoints: /latency/<ms>  /predict/<0|1>  /hfov/<deg>')
+    print(f'Initial: latency={args.latency}ms  HFOV={args.hfov_deg}deg  '
+          f'scene_depth={args.scene_depth}m  predict={"ON" if args.predict else "OFF"}')
+    print(f'Endpoints: /latency/<ms>  /predict/<0|1>  /hfov/<deg>  /scene_depth/<m>')
     print('============================\n')
 
     try:
