@@ -63,11 +63,33 @@ pip install pygame opencv-python numpy
 - `models/` - Patched TurtleBot3 model with physics fixes
 - `worlds/` - Custom Gazebo world with robot included
 
-## Latency API
+## HTTP API
 
 - `GET /` - Web UI with video and controls
 - `GET /video` - MJPEG stream
 - `GET /latency/<ms>` - Set artificial latency (e.g., `/latency/500`)
+- `GET /predict/<0|1>` - Toggle predictive display (compensates for video latency)
+- `GET /depth/<0|1>` - Toggle per-pixel depth mode (Phase 2b, requires torch + transformers + pillow)
+- `GET /hfov/<deg>` - Set camera horizontal FOV in degrees
+- `GET /scene_depth/<m>` - Set assumed scene depth (flat-plane proxy / depth-mode calibration)
+
+## Predictive Display
+
+Three modes:
+
+1. **Off (default)** - serves the delayed frame as-is. Demonstrates raw latency effect.
+2. **Flat-plane (Phase 2a)** - per-frame homography warp using the operator's command stream
+   integrated since the frame was captured. Assumes the scene sits at a single configurable
+   depth. No extra dependencies; runs at full MJPEG framerate. Eliminates move-and-wait for
+   yaw, gives a reasonable expansion-from-center for forward motion.
+3. **Per-pixel depth (Phase 2b)** - Depth Anything V2 estimates per-pixel depth, then
+   reprojects with a GPU z-buffer for true parallax. Native run only (Docker image doesn't
+   include torch). Install requirements:
+   ```bash
+   pip install torch transformers pillow
+   ```
+   First use downloads the Depth Anything V2 Small model (~100 MB). GPU strongly
+   recommended (CPU inference is ~2 s/frame; CUDA is ~30 ms/frame on RTX-class GPUs).
 
 ## Troubleshooting
 

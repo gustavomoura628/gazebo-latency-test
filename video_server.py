@@ -17,8 +17,139 @@ import time
 from collections import deque
 import argparse
 
+# Optional depth-mode dependencies (Phase 2b). The app runs fine without them;
+# the "use depth" checkbox just falls back to flat-plane (Phase 2a).
+try:
+    import torch
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    DEPTH_AVAILABLE = True
+except ImportError:
+    DEPTH_AVAILABLE = False
+
 # Configurable artificial latency (milliseconds)
 ARTIFICIAL_LATENCY_MS = 0
+
+# Lazy-loaded Depth Anything V2 model (only loaded when depth mode is first enabled)
+_DEPTH_MODEL = None
+_DEPTH_PROCESSOR = None
+_DEPTH_DEVICE = None
+_DEPTH_LOCK = Lock()  # protects loader from race when multiple clients first hit depth-mode
+
+
+def _ensure_depth_model():
+    """Lazy-load the depth model on first use. Raises RuntimeError if unavailable."""
+    global _DEPTH_MODEL, _DEPTH_PROCESSOR, _DEPTH_DEVICE
+    if not DEPTH_AVAILABLE:
+        raise RuntimeError("Depth mode requires: pip install torch transformers pillow")
+    with _DEPTH_LOCK:
+        if _DEPTH_MODEL is None:
+            _DEPTH_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if _DEPTH_DEVICE == 'cpu':
+                print("WARNING: depth mode running on CPU will be very slow (~2s/frame)")
+            print(f"Loading Depth Anything V2 Small on {_DEPTH_DEVICE} (first use)...")
+            model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+            _DEPTH_PROCESSOR = AutoImageProcessor.from_pretrained(model_id)
+            _DEPTH_MODEL = AutoModelForDepthEstimation.from_pretrained(model_id).to(_DEPTH_DEVICE).eval()
+            print("Depth model ready.")
+    return _DEPTH_MODEL, _DEPTH_PROCESSOR, _DEPTH_DEVICE
+
+
+def estimate_depth_tensor(frame_bgr, scene_depth_m):
+    """Run Depth Anything V2 on a BGR frame; return metric depth as a torch tensor on GPU.
+
+    Depth Anything outputs *relative* inverse depth; we calibrate to metric by
+    forcing the median pixel's depth to equal scene_depth_m. The caller's
+    scene_depth_m thus doubles as a global scale knob.
+
+    Returns: torch.Tensor of shape (H, W), float32, on _DEPTH_DEVICE, depth in meters.
+    """
+    model, processor, device = _ensure_depth_model()
+    h, w = frame_bgr.shape[:2]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    inputs = processor(images=frame_rgb, return_tensors="pt").to(device)
+    with torch.no_grad():
+        predicted = model(**inputs).predicted_depth  # (1, H', W'), inverse-depth-ish
+    # Upsample to original resolution
+    predicted = torch.nn.functional.interpolate(
+        predicted.unsqueeze(1), size=(h, w), mode='bicubic', align_corners=False
+    ).squeeze(1).squeeze(0)  # (H, W)
+    # Normalize to [0, 1] then invert into a depth-like quantity
+    dmin, dmax = predicted.min(), predicted.max()
+    norm = (predicted - dmin) / (dmax - dmin + 1e-6)  # 0=far, 1=near
+    eps = 0.05
+    raw_depth = 1.0 / (norm + eps)  # higher = farther
+    # Calibrate: force median to equal user-specified scene_depth_m
+    scale = scene_depth_m / raw_depth.median()
+    depth_m = (raw_depth * scale).clamp(0.1, 100.0)
+    return depth_m
+
+
+def predict_view_depth(frame_bgr, depth_m_tensor, dx_robot, dy_robot, dyaw_rad, hfov_rad):
+    """Per-pixel depth-aware reprojection. Forward-splat with GPU z-buffer.
+
+    Voids appear where (a) no source pixel maps to that destination (disocclusion
+    or off-frame), or (b) the source pixel is behind the new camera (Z <= 0).
+    """
+    if not DEPTH_AVAILABLE:
+        raise RuntimeError("predict_view_depth requires torch")
+    device = depth_m_tensor.device
+    h, w = frame_bgr.shape[:2]
+    fx = (w / 2.0) / np.tan(hfov_rad / 2.0)
+    cx, cy = w / 2.0, h / 2.0
+
+    # Transform parameters in old-camera frame
+    t_x = -float(dy_robot)
+    t_z = float(dx_robot)
+    c = float(np.cos(dyaw_rad))
+    s = float(np.sin(dyaw_rad))
+
+    frame_t = torch.from_numpy(np.ascontiguousarray(frame_bgr)).to(device)  # HxWx3 uint8
+    depth_t = depth_m_tensor.float()  # HxW
+
+    # Pixel grid
+    u_grid, v_grid = torch.meshgrid(
+        torch.arange(w, dtype=torch.float32, device=device),
+        torch.arange(h, dtype=torch.float32, device=device),
+        indexing='xy',
+    )
+
+    # Back-project to old-camera 3D points
+    X_old = (u_grid - cx) * depth_t / fx
+    Y_old = (v_grid - cy) * depth_t / fx
+    Z_old = depth_t
+
+    # Translate then rotate: P_new = R_y(+dyaw) @ (P_old - t)
+    X_sh = X_old - t_x
+    Z_sh = Z_old - t_z
+    X_new = c * X_sh + s * Z_sh
+    Y_new = Y_old
+    Z_new = -s * X_sh + c * Z_sh
+
+    valid_z = Z_new > 1e-3
+    Z_safe = torch.where(valid_z, Z_new, torch.ones_like(Z_new))
+    u_new = fx * X_new / Z_safe + cx
+    v_new = fx * Y_new / Z_safe + cy
+    u_int = u_new.long()
+    v_int = v_new.long()
+    valid = valid_z & (u_int >= 0) & (u_int < w) & (v_int >= 0) & (v_int < h)
+
+    HW = h * w
+    # Use a dummy slot at the end for invalid pixels so we never index out of bounds
+    flat_idx = (v_int * w + u_int).clamp(0, HW - 1)
+    flat_idx = torch.where(valid, flat_idx, torch.full_like(flat_idx, HW - 1)).flatten()
+    Z_flat = torch.where(valid, Z_new, torch.full_like(Z_new, float('inf'))).flatten()
+
+    # Z-buffer: for each destination pixel, keep the min source Z
+    zbuf = torch.full((HW,), float('inf'), device=device)
+    zbuf.scatter_reduce_(0, flat_idx, Z_flat, reduce='amin', include_self=True)
+
+    # Write the color of the winning source pixel into each destination
+    is_min = (zbuf.gather(0, flat_idx) == Z_flat) & valid.flatten()
+    src_flat = frame_t.reshape(-1, 3)
+    output_flat = torch.zeros((HW, 3), dtype=torch.uint8, device=device)
+    output_flat[flat_idx[is_min]] = src_flat[is_min.nonzero(as_tuple=True)[0]]
+
+    return output_flat.reshape(h, w, 3).cpu().numpy()
 
 class VideoBuffer:
     """Thread-safe frame buffer with latency injection"""
@@ -27,8 +158,9 @@ class VideoBuffer:
         self.frame_queue = deque()  # (timestamp, frame) pairs
         self.latency_ms = ARTIFICIAL_LATENCY_MS
         self.predict_enabled = False
+        self.use_depth = False  # Phase 2b: per-pixel depth reprojection
         self.hfov_rad = 1.085  # ~62 deg, typical TurtleBot3 Gazebo camera
-        self.scene_depth_m = 2.0  # assumed flat-plane scene distance (m)
+        self.scene_depth_m = 2.0  # plane depth (flat) / median depth (depth-mode)
 
     def set_latency(self, ms):
         with self.lock:
@@ -39,6 +171,17 @@ class VideoBuffer:
         with self.lock:
             self.predict_enabled = bool(enabled)
             print(f"Prediction {'ON' if self.predict_enabled else 'OFF'}")
+
+    def set_use_depth(self, enabled):
+        with self.lock:
+            want = bool(enabled)
+            if want and not DEPTH_AVAILABLE:
+                print("Depth mode requested but torch/transformers/pillow are not installed; "
+                      "falling back to flat-plane. Install with: pip install torch transformers pillow")
+                self.use_depth = False
+                return
+            self.use_depth = want
+            print(f"Depth mode {'ON' if self.use_depth else 'OFF'}")
 
     def set_hfov_deg(self, deg):
         with self.lock:
@@ -237,23 +380,46 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
+            # Per-handler cache: avoid re-running depth inference on the same
+            # stale frame while latency keeps us serving it for many ticks.
+            depth_cache = {'ts': None, 'tensor': None}
+
             try:
                 while True:
                     frame, frame_age_ms, frame_ts = video_buffer.get_frame_with_age()
                     if frame is not None:
                         display = frame.copy()
-                        pred_yaw_deg = 0.0
                         pred_dx = pred_dy = pred_yaw_deg = 0.0
+                        mode_label = "off"
                         if video_buffer.predict_enabled and frame_ts is not None and frame_age_ms > 0:
                             pred_dx, pred_dy, dyaw = twist_buffer.integrate(frame_ts, time.time())
                             pred_yaw_deg = np.rad2deg(dyaw)
-                            display = predict_view(display, pred_dx, pred_dy, dyaw,
-                                                   video_buffer.hfov_rad,
-                                                   video_buffer.scene_depth_m)
+                            mode_label = "flat"
+                            if video_buffer.use_depth:
+                                try:
+                                    if depth_cache['ts'] != frame_ts:
+                                        depth_cache['tensor'] = estimate_depth_tensor(
+                                            display, video_buffer.scene_depth_m
+                                        )
+                                        depth_cache['ts'] = frame_ts
+                                    display = predict_view_depth(
+                                        display, depth_cache['tensor'],
+                                        pred_dx, pred_dy, dyaw, video_buffer.hfov_rad
+                                    )
+                                    mode_label = "depth"
+                                except Exception as e:
+                                    print(f"Depth mode failed ({e}); falling back to flat-plane this frame")
+                                    display = predict_view(display, pred_dx, pred_dy, dyaw,
+                                                           video_buffer.hfov_rad,
+                                                           video_buffer.scene_depth_m)
+                            else:
+                                display = predict_view(display, pred_dx, pred_dy, dyaw,
+                                                       video_buffer.hfov_rad,
+                                                       video_buffer.scene_depth_m)
                         # Overlay debug info on frame
                         text = f"Latency: {video_buffer.latency_ms}ms | Frame age: {frame_age_ms:.0f}ms"
                         if video_buffer.predict_enabled:
-                            text += (f" | Pred: yaw {pred_yaw_deg:+.1f}deg,"
+                            text += (f" | Pred[{mode_label}]: yaw {pred_yaw_deg:+.1f}deg,"
                                      f" fwd {pred_dx:+.2f}m, lat {pred_dy:+.2f}m"
                                      f" @ d={video_buffer.scene_depth_m:.1f}m")
                         cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -288,6 +454,24 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'text/plain')
                 self.end_headers()
                 self.wfile.write(f'Prediction {"ON" if val else "OFF"}\n'.encode())
+            except:
+                self.send_response(400)
+                self.end_headers()
+
+        elif self.path.startswith('/depth/'):
+            # Toggle per-pixel depth mode: /depth/1 enables, /depth/0 disables
+            try:
+                val = int(self.path.split('/')[-1])
+                video_buffer.set_use_depth(val)
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                # set_use_depth may have refused if torch isn't available
+                actual = video_buffer.use_depth
+                self.wfile.write(
+                    f'Depth mode {"ON" if actual else "OFF"}'
+                    f'{" (torch unavailable; install pytorch+transformers+pillow)" if val and not actual else ""}\n'.encode()
+                )
             except:
                 self.send_response(400)
                 self.end_headers()
@@ -331,6 +515,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             cur_hfov_deg = video_buffer.hfov_rad * 180.0 / np.pi
             cur_scene_depth = video_buffer.scene_depth_m
             predict_checked = 'checked' if video_buffer.predict_enabled else ''
+            depth_checked = 'checked' if video_buffer.use_depth else ''
+            depth_available_note = '' if DEPTH_AVAILABLE else \
+                ' <span style="color:#ff8080;font-size:12px;">(install torch + transformers + pillow)</span>'
             html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -360,9 +547,12 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <button onclick="setLatency(3000)">3s</button>
         <button onclick="setLatency(5000)">5s</button>
         <button onclick="setLatency(10000)">10s</button>
-        <p style="margin-top: 20px;">Predictive Display (yaw + forward/lateral, flat-plane):
+        <p style="margin-top: 20px;">Predictive Display:
             <label style="margin-left: 10px;">
                 <input type="checkbox" id="predict" {predict_checked} onchange="setPredict(this.checked)"> Enabled
+            </label>
+            <label style="margin-left: 20px;">
+                <input type="checkbox" id="usedepth" {depth_checked} onchange="setUseDepth(this.checked)"> Use per-pixel depth (Phase 2b){depth_available_note}
             </label>
         </p>
         <p>Camera HFOV:
@@ -396,6 +586,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         }}
         function setPredict(enabled) {{
             fetch('/predict/' + (enabled ? 1 : 0));
+        }}
+        function setUseDepth(enabled) {{
+            fetch('/depth/' + (enabled ? 1 : 0));
         }}
         function setHfov(deg) {{
             fetch('/hfov/' + deg);
@@ -457,6 +650,8 @@ def main():
     parser.add_argument('--scene-depth', type=float, default=2.0,
                         help='Assumed flat-plane scene depth in meters (default 2.0)')
     parser.add_argument('--predict', action='store_true', help='Enable predictive display at startup')
+    parser.add_argument('--use-depth', action='store_true',
+                        help='Enable per-pixel depth mode (Phase 2b, requires torch+transformers+pillow)')
     args = parser.parse_args()
 
     ARTIFICIAL_LATENCY_MS = args.latency
@@ -465,6 +660,8 @@ def main():
     video_buffer.set_scene_depth_m(args.scene_depth)
     if args.predict:
         video_buffer.set_predict(True)
+    if args.use_depth:
+        video_buffer.set_use_depth(True)
 
     rclpy.init()
     node = CameraSubscriber()
@@ -479,8 +676,11 @@ def main():
     print(f'\n=== Video Server Started ===')
     print(f'View at: http://127.0.0.1:{args.port}/')
     print(f'Initial: latency={args.latency}ms  HFOV={args.hfov_deg}deg  '
-          f'scene_depth={args.scene_depth}m  predict={"ON" if args.predict else "OFF"}')
-    print(f'Endpoints: /latency/<ms>  /predict/<0|1>  /hfov/<deg>  /scene_depth/<m>')
+          f'scene_depth={args.scene_depth}m  predict={"ON" if args.predict else "OFF"}  '
+          f'depth={"ON" if video_buffer.use_depth else "OFF"}')
+    if not DEPTH_AVAILABLE:
+        print(f'Depth mode unavailable (no torch/transformers/pillow); flat-plane only.')
+    print(f'Endpoints: /latency/<ms>  /predict/<0|1>  /depth/<0|1>  /hfov/<deg>  /scene_depth/<m>')
     print('============================\n')
 
     try:
