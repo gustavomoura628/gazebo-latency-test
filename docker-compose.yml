@@ -15,7 +15,7 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # X11 auth
       - ${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.Xauthority:ro
-      # For GPU access (if available)
+      # For integrated GPU access (Gazebo rendering)
       - /dev/dri:/dev/dri
 
     # Network mode host for easy port access
@@ -27,3 +27,15 @@ services:
     # Interactive terminal
     stdin_open: true
     tty: true
+
+    # NVIDIA GPU pass-through for Phase 2b depth mode.
+    # Requires nvidia-container-toolkit on the host (sudo apt install nvidia-container-toolkit).
+    # If you don't have an NVIDIA GPU or nvidia-container-toolkit, comment this block out;
+    # the depth checkbox will then fall back to flat-plane Phase 2a automatically.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -83,13 +83,17 @@ Three modes:
    depth. No extra dependencies; runs at full MJPEG framerate. Eliminates move-and-wait for
    yaw, gives a reasonable expansion-from-center for forward motion.
 3. **Per-pixel depth (Phase 2b)** - Depth Anything V2 estimates per-pixel depth, then
-   reprojects with a GPU z-buffer for true parallax. Native run only (Docker image doesn't
-   include torch). Install requirements:
-   ```bash
-   pip install torch transformers pillow
-   ```
-   First use downloads the Depth Anything V2 Small model (~100 MB). GPU strongly
-   recommended (CPU inference is ~2 s/frame; CUDA is ~30 ms/frame on RTX-class GPUs).
+   reprojects with a GPU z-buffer for true parallax. Baked into the Docker image — the
+   model is pre-cached at build time so first use is instant, no runtime download.
+   Requires NVIDIA GPU + `nvidia-container-toolkit` on the host for usable performance
+   (CUDA inference ~30 ms/frame on RTX-class GPUs; CPU is ~2 s/frame, technically works
+   but too slow for live use).
+
+   If you don't have an NVIDIA GPU, comment out the `deploy:` block in
+   `docker-compose.yml` and the depth checkbox will refuse with a clear message,
+   falling back to flat-plane Phase 2a.
+
+   For native (non-Docker) runs, install: `pip install torch transformers pillow accelerate`
 
 ## Troubleshooting
 

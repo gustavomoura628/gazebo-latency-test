@@ -25,11 +25,32 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-dri \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
+# Install Python packages (base)
 RUN pip3 install --no-cache-dir \
     pygame \
     opencv-python-headless \
     numpy
+
+# Install Phase 2b deps: torch with CUDA, transformers, pillow.
+# Torch CUDA wheels bundle the CUDA libs they need, so we don't have to
+# install CUDA system-wide; we just need an NVIDIA driver on the host and
+# the nvidia-container runtime to pass the GPU through at run time.
+# CPU fallback works too but is unusably slow for depth inference.
+RUN pip3 install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 install --no-cache-dir \
+    transformers \
+    pillow \
+    accelerate
+
+# Pre-download Depth Anything V2 Small at build time so first run is instant.
+# Cache lives in /root/.cache/huggingface and is baked into the image.
+RUN python3 -c "\
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation; \
+mid = 'depth-anything/Depth-Anything-V2-Small-hf'; \
+AutoImageProcessor.from_pretrained(mid); \
+AutoModelForDepthEstimation.from_pretrained(mid); \
+print('Depth Anything V2 Small pre-cached.')"
 
 # Set up workspace
 WORKDIR /app
