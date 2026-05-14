@@ -31,28 +31,26 @@ RUN pip3 install --no-cache-dir \
     opencv-python-headless \
     numpy
 
-# Install Phase 2b deps: torch with CUDA + timm (a MiDaS dependency).
+# Install Phase 2b deps: torch with CUDA, transformers, pillow.
 # Torch CUDA wheels bundle the CUDA libs they need, so we don't have to
 # install CUDA system-wide; we just need an NVIDIA driver on the host and
 # the nvidia-container runtime to pass the GPU through at run time.
 # CPU fallback works too but is unusably slow for depth inference.
 RUN pip3 install --no-cache-dir \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu121
+    torch --index-url https://download.pytorch.org/whl/cu121
 RUN pip3 install --no-cache-dir \
-    timm
+    transformers \
+    pillow \
+    accelerate
 
-# Pre-cache MiDaS small at build time so first run is instant. The torch.hub
-# loader clones intel-isl/MiDaS from GitHub and downloads the .pt weights
-# from a GitHub release (~80 MB). Result lives in /root/.cache/torch/hub
-# and is baked into the image. (Depth Anything V2 would be a higher-quality
-# choice but its weights live on huggingface.co, which is blocked from some
-# networks; MiDaS is the predecessor from the same line of work and works
-# fine for predictive-display parallax.)
+# Pre-download Depth Anything V2 Small at build time so first run is instant.
+# Cache lives in /root/.cache/huggingface and is baked into the image.
 RUN python3 -c "\
-import torch; \
-torch.hub.load('intel-isl/MiDaS', 'MiDaS_small', trust_repo=True); \
-torch.hub.load('intel-isl/MiDaS', 'transforms', trust_repo=True); \
-print('MiDaS small pre-cached.')"
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation; \
+mid = 'depth-anything/Depth-Anything-V2-Small-hf'; \
+AutoImageProcessor.from_pretrained(mid); \
+AutoModelForDepthEstimation.from_pretrained(mid); \
+print('Depth Anything V2 Small pre-cached.')"
 
 # Set up workspace
 WORKDIR /app

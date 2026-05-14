@@ -82,23 +82,18 @@ Three modes:
    integrated since the frame was captured. Assumes the scene sits at a single configurable
    depth. No extra dependencies; runs at full MJPEG framerate. Eliminates move-and-wait for
    yaw, gives a reasonable expansion-from-center for forward motion.
-3. **Per-pixel depth (Phase 2b)** - MiDaS small (via `torch.hub`) estimates per-pixel
-   depth, then we reproject with a GPU z-buffer for true parallax. Baked into the
-   Docker image — the model is pre-cached at build time, no runtime download.
+3. **Per-pixel depth (Phase 2b)** - Depth Anything V2 estimates per-pixel depth, then
+   reprojects with a GPU z-buffer for true parallax. Baked into the Docker image — the
+   model is pre-cached at build time so first use is instant, no runtime download.
    Requires NVIDIA GPU + `nvidia-container-toolkit` on the host for usable performance
-   (CUDA inference ~10 ms/frame on RTX-class GPUs; CPU ~1 s/frame, technically works
+   (CUDA inference ~30 ms/frame on RTX-class GPUs; CPU is ~2 s/frame, technically works
    but too slow for live use).
 
    If you don't have an NVIDIA GPU, comment out the `deploy:` block in
    `docker-compose.yml` and the depth checkbox will refuse with a clear message,
    falling back to flat-plane Phase 2a.
 
-   For native (non-Docker) runs, install: `pip install torch torchvision timm`
-
-   *Note:* Depth Anything V2 would be a slightly better model but its weights live on
-   `huggingface.co`, which is blocked from some networks. MiDaS is the direct
-   predecessor and the weights ship via GitHub. For predictive-display parallax,
-   where only rough depth ordering matters, the difference is negligible.
+   For native (non-Docker) runs, install: `pip install torch transformers pillow accelerate`
 
 ## Troubleshooting
 

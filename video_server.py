@@ -19,14 +19,9 @@ import argparse
 
 # Optional depth-mode dependencies (Phase 2b). The app runs fine without them;
 # the "use depth" checkbox just falls back to flat-plane (Phase 2a).
-#
-# We use MiDaS small via torch.hub (GitHub-hosted, ~22M params, ~80 MB weights)
-# rather than Depth Anything V2 because Depth Anything's weights live on
-# huggingface.co which is unreachable from some networks. MiDaS is the direct
-# predecessor; for predictive-display parallax (where only rough depth ordering
-# matters) the quality difference is negligible.
 try:
     import torch
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
     DEPTH_AVAILABLE = True
 except ImportError:
     DEPTH_AVAILABLE = False
@@ -34,56 +29,53 @@ except ImportError:
 # Configurable artificial latency (milliseconds)
 ARTIFICIAL_LATENCY_MS = 0
 
-# Lazy-loaded MiDaS small model (loaded on first depth-mode toggle).
-# In Docker, the weights are pre-cached at build time so this is instant.
+# Lazy-loaded Depth Anything V2 model (only loaded when depth mode is first enabled)
 _DEPTH_MODEL = None
-_DEPTH_TRANSFORM = None
+_DEPTH_PROCESSOR = None
 _DEPTH_DEVICE = None
-_DEPTH_LOCK = Lock()  # protects loader from race when multiple clients hit depth-mode at once
+_DEPTH_LOCK = Lock()  # protects loader from race when multiple clients first hit depth-mode
 
 
 def _ensure_depth_model():
-    """Lazy-load MiDaS small. Raises RuntimeError if torch is unavailable."""
-    global _DEPTH_MODEL, _DEPTH_TRANSFORM, _DEPTH_DEVICE
+    """Lazy-load the depth model on first use. Raises RuntimeError if unavailable."""
+    global _DEPTH_MODEL, _DEPTH_PROCESSOR, _DEPTH_DEVICE
     if not DEPTH_AVAILABLE:
-        raise RuntimeError("Depth mode requires: pip install torch timm")
+        raise RuntimeError("Depth mode requires: pip install torch transformers pillow")
     with _DEPTH_LOCK:
         if _DEPTH_MODEL is None:
             _DEPTH_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
             if _DEPTH_DEVICE == 'cpu':
-                print("WARNING: depth mode on CPU is slow (~1s/frame); GPU strongly recommended")
-            print(f"Loading MiDaS small on {_DEPTH_DEVICE} (first use)...")
-            _DEPTH_MODEL = torch.hub.load(
-                'intel-isl/MiDaS', 'MiDaS_small', trust_repo=True
-            ).to(_DEPTH_DEVICE).eval()
-            transforms = torch.hub.load('intel-isl/MiDaS', 'transforms', trust_repo=True)
-            _DEPTH_TRANSFORM = transforms.small_transform
+                print("WARNING: depth mode running on CPU will be very slow (~2s/frame)")
+            print(f"Loading Depth Anything V2 Small on {_DEPTH_DEVICE} (first use)...")
+            model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+            _DEPTH_PROCESSOR = AutoImageProcessor.from_pretrained(model_id)
+            _DEPTH_MODEL = AutoModelForDepthEstimation.from_pretrained(model_id).to(_DEPTH_DEVICE).eval()
             print("Depth model ready.")
-    return _DEPTH_MODEL, _DEPTH_TRANSFORM, _DEPTH_DEVICE
+    return _DEPTH_MODEL, _DEPTH_PROCESSOR, _DEPTH_DEVICE
 
 
 def estimate_depth_tensor(frame_bgr, scene_depth_m):
-    """Run MiDaS small on a BGR frame; return metric depth as a torch tensor on GPU.
+    """Run Depth Anything V2 on a BGR frame; return metric depth as a torch tensor on GPU.
 
-    MiDaS outputs *relative* inverse depth (higher = closer). We calibrate to
-    metric by forcing the median pixel's depth to equal scene_depth_m. The
-    caller's scene_depth_m thus doubles as a global depth-scale knob.
+    Depth Anything outputs *relative* inverse depth; we calibrate to metric by
+    forcing the median pixel's depth to equal scene_depth_m. The caller's
+    scene_depth_m thus doubles as a global scale knob.
 
     Returns: torch.Tensor of shape (H, W), float32, on _DEPTH_DEVICE, depth in meters.
     """
-    model, transform, device = _ensure_depth_model()
+    model, processor, device = _ensure_depth_model()
     h, w = frame_bgr.shape[:2]
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    input_batch = transform(frame_rgb).to(device)
+    inputs = processor(images=frame_rgb, return_tensors="pt").to(device)
     with torch.no_grad():
-        predicted = model(input_batch)  # (1, H', W'), inverse-depth (higher = closer)
+        predicted = model(**inputs).predicted_depth  # (1, H', W'), inverse-depth-ish
     # Upsample to original resolution
     predicted = torch.nn.functional.interpolate(
         predicted.unsqueeze(1), size=(h, w), mode='bicubic', align_corners=False
     ).squeeze(1).squeeze(0)  # (H, W)
-    # Normalize to [0, 1] (1 = near, 0 = far) then invert into a depth-like quantity
+    # Normalize to [0, 1] then invert into a depth-like quantity
     dmin, dmax = predicted.min(), predicted.max()
-    norm = (predicted - dmin) / (dmax - dmin + 1e-6)
+    norm = (predicted - dmin) / (dmax - dmin + 1e-6)  # 0=far, 1=near
     eps = 0.05
     raw_depth = 1.0 / (norm + eps)  # higher = farther
     # Calibrate: force median to equal user-specified scene_depth_m
